@@ -10,15 +10,16 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
-#include <unistd.h>  // Для close
+#include <unistd.h> 
 #include <thread>
-#include <vector>
+#include <filesystem> 
 
 #define PORT 7432
 #define BUFFER_SIZE 1024
 
 using namespace std;
 using json = nlohmann::json;
+namespace fs = std::filesystem;
 
 // Самописная структура для хранения вектора
 template<typename T>
@@ -341,6 +342,8 @@ void insert_data(const string& table_name, const CustVector<string>& values) {
         string value = values[i];
         if (value.front() == '(') value = value.substr(1);
         if (value.back() == ')') value = value.substr(0, value.size() - 1);
+        if (value.front() == '\'' || value.front() == '"') value = value.substr(1);
+        if (value.back() == '\'' || value.back() == '"') value = value.substr(0, value.size() - 1);
         new_row.push_back(value);
     }
 
@@ -586,32 +589,26 @@ void create_tables_from_schema(const string& schema_file) {
 // Функция для парсинга команд
 CustVector<string> parse_command(const string& command) {
     CustVector<string> tokens;
-    istringstream iss(command);
-    string token;
-    bool inside_quotes = false;
-    string current_token = "";
+    regex token_regex(R"(\s*("[^"]*"|'[^']*'|[^"\s]+)\s*)");
+    sregex_iterator iter(command.begin(), command.end(), token_regex);
+    sregex_iterator end;
 
-    while (iss >> token) {
-        if (token.front() == '(' && token.back() == ')') {
-            tokens.push_back(token.substr(1, token.size() - 2));
-        } else if (token.front() == '(') {
-            inside_quotes = true;
-            current_token += token.substr(1) + " ";
-        } else if (token.back() == ')') {
-            inside_quotes = false;
-            current_token += token.substr(0, token.size() - 1);
-            tokens.push_back(current_token);
-            current_token = "";
-        } else if (inside_quotes) {
-            current_token += token + " ";
-        } else {
-            tokens.push_back(token);
+    while (iter != end) {
+        string token = (*iter)[1].str();
+        // Удаляем кавычки, если они есть
+        if ((token.front() == '"' && token.back() == '"') || (token.front() == '\'' && token.back() == '\'')) {
+            token = token.substr(1, token.size() - 2);
         }
+        tokens.push_back(token);
+        ++iter;
     }
 
-    if (!current_token.empty()) {
-        tokens.push_back(current_token);
+    // Отладочный вывод для проверки токенов
+    cout << "Parsed tokens: ";
+    for (size_t i = 0; i < tokens.size; ++i) {
+        cout << "[" << tokens[i] << "] ";
     }
+    cout << endl;
 
     return tokens;
 }
@@ -722,7 +719,6 @@ string handle_query(const string& query) {
         return "Unknown query.";
     }
 }
-
 void handle_client(int client_socket) {
     char buffer[BUFFER_SIZE] = {0};
     int bytes_read = read(client_socket, buffer, BUFFER_SIZE);
@@ -739,14 +735,33 @@ void handle_client(int client_socket) {
     string response = handle_query(query);
 
     // Отправка ответа клиенту
-    int bytes_sent = send(client_socket, response.c_str(), response.size(), 0);
-    if (bytes_sent < 0) {
-        perror("send");
+    int total_sent = 0;
+    int bytes_left = response.size();
+    const char* response_data = response.c_str();
+
+    while (total_sent < response.size()) {
+        int bytes_sent = send(client_socket, response_data + total_sent, bytes_left, 0);
+        if (bytes_sent < 0) {
+            perror("send");
+            break;
+        }
+        total_sent += bytes_sent;
+        bytes_left -= bytes_sent;
     }
+
     cout << "Response sent to client: " << response << endl;
 
     // Закрытие сокета
     close(client_socket);
+}
+
+// Функция для проверки наличия .csv файла и загрузки таблицы
+void check_and_load_table(const string& table_name) {
+    string file_path = table_name + ".csv";
+    if (fs::exists(file_path)) {
+        cout << "CSV file found for table " << table_name << ". Loading table..." << endl;
+        load_table_csv(table_name);
+    }
 }
 
 int main() {
@@ -786,6 +801,14 @@ int main() {
 
     // Загрузка таблиц из JSON-файла
     create_tables_from_schema("schema.json");
+
+    // Проверка наличия .csv файлов и загрузка таблиц
+    for (const auto& entry : fs::directory_iterator(".")) {
+        if (entry.path().extension() == ".csv") {
+            string table_name = entry.path().stem().string();
+            check_and_load_table(table_name);
+        }
+    }
 
     while (true) {
         // Принятие подключения
